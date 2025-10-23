@@ -1,0 +1,360 @@
+#include <ESP8266WiFi.h>
+#include <PubSubClient.h>
+#include <GyverOLED.h>
+#include <SoftwareSerial.h>
+#include <TinyGPS++.h>
+
+// Создаем объекты
+GyverOLED<SSD1306_128x32, OLED_NO_BUFFER> oled;
+TinyGPSPlus gps;
+SoftwareSerial gpsSerial(4, 3); // RX, TX (D2, D9)
+
+// Настройки WiFi и MQTT
+const char* ssid = "ZTE-fb489c";
+const char* password = "601888fb";
+const char* mqtt_server = "m2.wqtt.ru";
+int mqtt_port = 12423;
+const char* mqtt_login = "u_D5J6F7";
+const char* mqtt_pass = "Kb4LjoNU";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// Настройки измерения шума
+const int sampleWindow = 50;
+const int Input_Pin = A0;
+const float Vref = 3.2;
+const float Vrms_min = 0.0001;
+
+// Переменные
+float smoothed_dB = 0;
+const float smoothing = 0.3;
+
+// Таймеры
+unsigned long previousNoiseMillis = 0;
+unsigned long previousGPSMillis = 0;
+unsigned long previousDisplayMillis = 0;
+unsigned long previousMQTTMillis = 0;
+unsigned long lastMsg = 0;
+
+const unsigned long noiseInterval = 100;
+const unsigned long gpsInterval = 100;
+const unsigned long displayInterval = 2000;
+const unsigned long mqttInterval = 5000; // Отправка MQTT каждые 5 секунд
+
+bool showNoise = true;
+String lastGPSData = "No GPS signal";
+
+#define MSG_BUFFER_SIZE (100)
+char msg[MSG_BUFFER_SIZE];
+
+void setup_wifi() {
+  delay(10);
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  randomSeed(micros());
+
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("Message arrived [");
+  Serial.print(topic);
+  Serial.print("] ");
+  for (int i = 0; i < length; i++) {
+    Serial.print((char)payload[i]);
+  }
+  Serial.println();
+}
+
+void reconnect() {
+
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    // Create a random client ID
+    String clientId = "ESP8266Client-";
+    clientId += String(random(0xffff), HEX);
+    // Attempt to connect
+    if (client.connect(clientId.c_str(), mqtt_login, mqtt_pass)) {
+      Serial.println("connected");
+      // Once connected, publish an announcement...
+      client.publish("outTopic", "hello world");
+      // ... and resubscribe
+      client.subscribe("inTopic");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+      // Wait 5 seconds before retrying
+      delay(5000);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  gpsSerial.begin(9600);
+  
+  // Инициализация дисплея
+  oled.init();
+  oled.clear();
+  
+  // Подключение к WiFi
+  setup_wifi();
+  
+  // Настройка MQTT
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
+  
+  // Вывод начального сообщения
+  oled.setScale(1);
+  oled.home();
+  oled.print("Noise+GPS+MQTT");
+  oled.setCursor(0, 2);
+  oled.print("Starting...");
+  oled.update();
+  
+  delay(2000);
+  oled.clear();
+  
+  Serial.println("Noise + GPS + MQTT started");
+  Serial.println("==========================================");
+}
+
+
+void loop() {
+  unsigned long currentMillis = millis();
+  
+  // Проверка подключения MQTT
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+  
+  // Обработка GPS
+  while (gpsSerial.available() > 0) {
+    gps.encode(gpsSerial.read());
+  }
+  
+  // Измерение шума каждые 100мс
+  if (currentMillis - previousNoiseMillis >= noiseInterval) {
+    previousNoiseMillis = currentMillis;
+    measureNoise();
+  }
+  
+  // Вывод GPS в Serial каждые 100мс
+  if (currentMillis - previousGPSMillis >= gpsInterval) {
+    previousGPSMillis = currentMillis;
+    printGPSData();
+  }
+  
+  // Отправка данных по MQTT каждые 5 секунд
+  if (currentMillis - previousMQTTMillis >= mqttInterval) {
+    previousMQTTMillis = currentMillis;
+    sendMQTTData();
+  }
+  
+  // Переключение экранов каждые 2 секунды
+  if (currentMillis - previousDisplayMillis >= displayInterval) {
+    previousDisplayMillis = currentMillis;
+    showNoise = !showNoise;
+    updateDisplay();
+  }
+}
+
+void measureNoise() {
+  unsigned long startMillis = millis();
+  unsigned int InMax = 0, InMin = 1023;
+
+  while (millis() - startMillis < sampleWindow) {
+    int val = analogRead(Input_Pin);
+    if (val > InMax) InMax = val;
+    if (val < InMin) InMin = val;
+  }
+
+  unsigned int peak = InMax - InMin;
+  float current_dB = 0;
+
+  if (peak >= 10) {
+    float Vpp = (peak * Vref) / 1023.0;
+    float Vrms = Vpp / 2.828;
+    current_dB = 20.0 * log10((Vrms + 1e-6) / Vrms_min);
+    current_dB = constrain(current_dB, 0, 120);
+  }
+
+  smoothed_dB = smoothed_dB * (1 - smoothing) + current_dB * smoothing;
+}
+
+void printGPSData() {
+  if (gps.location.isValid() && gps.time.isValid()) {
+    // Форматируем время (GMT+3 для Москвы)
+    int hour = gps.time.hour() + 3;
+    if (hour >= 24) hour -= 24;
+    int minute = gps.time.minute();
+    int second = gps.time.second();
+    
+    // Форматируем координаты
+    float latitude = gps.location.lat();
+    float longitude = gps.location.lng();
+    int satellites = gps.satellites.value();
+    
+    // Сохраняем для отображения на дисплее
+    lastGPSData = String(latitude, 4) + "N " + String(longitude, 4) + "E";
+    
+    // Выводим в Serial
+    Serial.print("[");
+    if (hour < 10) Serial.print("0");
+    Serial.print(hour);
+    Serial.print(":");
+    if (minute < 10) Serial.print("0");
+    Serial.print(minute);
+    Serial.print(":");
+    if (second < 10) Serial.print("0");
+    Serial.print(second);
+    Serial.print("] ");
+    
+    Serial.print("Lat: ");
+    Serial.print(latitude, 6);
+    Serial.print(", Lon: ");
+    Serial.print(longitude, 6);
+    Serial.print(", Sat: ");
+    Serial.print(satellites);
+    
+    // Дополнительная информация
+    if (gps.altitude.isValid()) {
+      Serial.print(", Alt: ");
+      Serial.print(gps.altitude.meters(), 1);
+      Serial.print("m");
+    }
+    
+    if (gps.speed.isValid()) {
+      Serial.print(", Speed: ");
+      Serial.print(gps.speed.kmph(), 1);
+      Serial.print("km/h");
+    }
+    
+    Serial.println();
+    
+  } else if (gps.location.isValid()) {
+    // Если есть координаты, но нет времени
+    float latitude = gps.location.lat();
+    float longitude = gps.location.lng();
+    int satellites = gps.satellites.value();
+    
+    lastGPSData = String(latitude, 4) + "N " + String(longitude, 4) + "E";
+    
+    Serial.print("[NO TIME] ");
+    Serial.print("Lat: ");
+    Serial.print(latitude, 6);
+    Serial.print(", Lon: ");
+    Serial.print(longitude, 6);
+    Serial.print(", Sat: ");
+    Serial.println(satellites);
+    
+  } else {
+    // Нет GPS сигнала
+    lastGPSData = "No GPS signal";
+  }
+}
+
+
+void sendMQTTData() {
+  // Отправка уровня шума
+  String noiseTopic = "noise/level";
+  String noiseValue = String(smoothed_dB, 1);
+  client.publish(noiseTopic.c_str(), noiseValue.c_str());
+  Serial.println("MQTT published: " + noiseTopic + " = " + noiseValue);
+  
+  // Отправка GPS данных, если доступны
+  if (gps.location.isValid()) {
+    String gpsTopic = "gps/location";
+    String gpsValue = String(gps.location.lat(), 6) + "," + String(gps.location.lng(), 6);
+    client.publish(gpsTopic.c_str(), gpsValue.c_str());
+    Serial.println("MQTT published: " + gpsTopic + " = " + gpsValue);
+    
+    // Отправка количества спутников
+    String satTopic = "gps/satellites";
+    String satValue = String(gps.satellites.value());
+    client.publish(satTopic.c_str(), satValue.c_str());
+  }
+  
+  // Отправка статуса WiFi
+  String wifiTopic = "system/wifi";
+  String wifiValue = String(WiFi.RSSI());
+  client.publish(wifiTopic.c_str(), wifiValue.c_str());
+}
+
+void updateDisplay() {
+  oled.clear();
+  
+  if (showNoise) {
+    // Экран уровня шума
+    oled.setScale(1);
+    oled.setCursor(0, 0);
+    oled.print("NOISE LEVEL");
+    
+    oled.setScale(2);
+    oled.setCursor(0, 1);
+    if (smoothed_dB < 10) oled.print(" ");
+    oled.print(smoothed_dB, 1);
+    oled.print(" dB");
+    
+    // Индикатор уровня
+    oled.setScale(1);
+    oled.setCursor(0, 3);
+    if (smoothed_dB < 40) {
+      oled.print("Quiet");
+    } else if (smoothed_dB < 70) {
+      oled.print("Normal");
+    } else {
+      oled.print("LOUD!");
+    }
+    
+  } else {
+    // Экран GPS и статуса
+    oled.setScale(1);
+    oled.setCursor(0, 0);
+    oled.print("GPS & STATUS");
+    
+    if (gps.location.isValid()) {
+      // Показываем спутники
+      oled.setCursor(90, 0);
+      oled.print("SAT:");
+      oled.print(gps.satellites.value());
+      
+      // Сокращенные координаты
+      oled.setCursor(0, 2);
+      oled.print(gps.location.lat(), 4);
+      oled.setCursor(0, 3);
+      oled.print(gps.location.lng(), 4);
+      
+    } else {
+      oled.setScale(1);
+      oled.setCursor(0, 2);
+      oled.print("Searching GPS...");
+    }
+    
+    // Статус MQTT
+    oled.setCursor(70, 3);
+    if (client.connected()) {
+      oled.print("MQTT:OK");
+    } else {
+      oled.print("MQTT:NO");
+    }
+  }
+  
+  oled.update();
+}
