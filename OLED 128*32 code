@@ -1,0 +1,65 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 32
+#define OLED_RESET -1
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+void setup() {
+  Wire.begin(D4, D5);
+  
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    while(1); // Остановка при ошибке
+  }
+  
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  
+  // Стартовый экран
+  display.setTextSize(2);
+  display.setCursor(20, 0);
+  display.println("READY");
+  display.setTextSize(1);
+  display.setCursor(0, 20);
+  display.println("128x32 OLED OK");
+  display.display();
+  delay(2000);
+}
+
+void loop() {
+  display.clearDisplay();
+  
+  // Строка 1: Заголовок
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("Wemos D1 R1");
+  
+  // Строка 2: Время работы
+  display.setCursor(0, 10);
+  display.print("Uptime: ");
+  display.print(millis() / 1000);
+  display.print("s");
+  
+  // Строка 3: Аналоговый вход
+  display.setCursor(0, 20);
+  display.print("A0: ");
+  display.print(analogRead(A0));
+  
+  // Мигающий индикатор
+  static bool blink = false;
+  static unsigned long blinkTime = 0;
+  
+  if (millis() - blinkTime > 500) {
+    blinkTime = millis();
+    blink = !blink;
+  }
+  
+  display.setCursor(120, 0);
+  display.print(blink ? "*" : " ");
+  
+  display.display();
+  delay(100);
+}
